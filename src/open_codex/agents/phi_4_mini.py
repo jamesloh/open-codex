@@ -1,71 +1,124 @@
 import time
-from typing import List, cast
-from llama_cpp import CreateCompletionResponse, Llama
-from open_codex.interfaces.llm_agent import LLMAgent
+from typing import List, cast, Dict, Any
+import requests
+import json
 import contextlib
 import os
-from huggingface_hub import hf_hub_download # type: ignore
+from open_codex.interfaces.llm_agent import LLMAgent
+
+MODEL_NAME="smollm2:1.7b"
 
 class AgentPhi4Mini(LLMAgent):
     def download_model(self, model_filename: str,
-                        repo_id: str, 
-                        local_dir: str) -> str:
+                      repo_id: str, 
+                      local_dir: str) -> str:
+        """
+        Kept for compatibility with LLMAgent, but not used with Ollama.
+        This is a placeholder that returns a mock path.
+        """
         print(
-            "\n🤖 Thank you for using Open Codex!\n"
-            "📦 For the first run, we need to download the model from Hugging Face.\n"
-            "⏬ This only happens once – it’ll be cached locally for future use.\n"
-            "🔄 Sit tight, the download will begin now...\n"
+            "\n🤖 Thank you for using Open Codex with Ollama!\n"
+            "📡 We'll use the model served by Ollama instead of downloading it.\n"
         )
-        print("\n⏬ Downloading model phi4-mini ...")
+        # Return a mock path for compatibility
+        return f"ollama://{MODEL_NAME}"
         
-        start = time.time()
-        model_path:str = hf_hub_download(
-            repo_id=repo_id,
-            filename=model_filename,
-            local_dir=local_dir,
-        )
-        end = time.time()
-        print(f"✅ Model downloaded in {end - start:.2f}s\n")
-        return model_path
-
     def __init__(self, system_prompt: str):
-        model_filename = "Phi-4-mini-instruct-Q3_K_L.gguf"
-        repo_id = "lmstudio-community/Phi-4-mini-instruct-GGUF"
-        local_dir = os.path.expanduser("~/.cache/open-codex")
-        model_path = os.path.join(local_dir, model_filename)
-
-        # check if the model is already downloaded
-        if not os.path.exists(model_path):
-            # download the model
-            model_path = self.download_model(model_filename, repo_id, local_dir)
-        else:
-            print(f"We are locking and loading the model for you...\n")
-
-        # suppress the stderr output from llama_cpp
-        # this is a workaround for the llama_cpp library
-        # which prints a lot of warnings and errors to stderr
-        # when loading the model
-        # this is a temporary solution until the library is fixed
-        with AgentPhi4Mini.suppress_native_stderr():
-            self.llm: Llama = Llama(model_path=model_path)  # type: ignore
-
+        # Get the Ollama API base URL from environment variable
+        # Raise an error if the environment variable is not set
+        try:
+            self.ollama_api_base = os.environ["OLLAMA_API_BASE"]
+        except KeyError:
+            raise EnvironmentError("OLLAMA_API_BASE environment variable must be set")
+            
+        self.model_name = MODEL_NAME
         self.system_prompt = system_prompt
-
+        
+        print(f"We are connecting to the Ollama model at {self.ollama_api_base}...\n")
+        
+        # Check if the model is available
+        self.check_model_availability()
+        
+        # Create a pseudo-llm object that mimics the llama_cpp Llama interface
+        # but actually uses Ollama API under the hood
+        self.llm = self.OllamaLLM(self.ollama_api_base, self.model_name)
+        
+    class OllamaLLM:
+        """A wrapper class that mimics the Llama interface but uses Ollama API"""
+        def __init__(self, api_base: str, model_name: str):
+            self.api_base = api_base
+            self.model_name = model_name
+            
+        def __call__(self, prompt: str, max_tokens: int = 100, 
+                    temperature: float = 0.2, stream: bool = False) -> Dict[str, Any]:
+            """Mimics the Llama.__call__ interface but uses Ollama API"""
+            try:
+                payload = {
+                    "model": self.model_name,
+                    "prompt": prompt,
+                    "options": {
+                        "temperature": temperature,
+                        "num_predict": max_tokens
+                    },
+                    "stream": False  # Always False for now, regardless of stream parameter
+                }
+                
+                response = requests.post(
+                    f"{self.api_base}/api/generate", 
+                    json=payload
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    # Return in a format compatible with llama_cpp's output
+                    return {
+                        "choices": [
+                            {
+                                "text": result.get("response", ""),
+                                "finish_reason": "length"
+                            }
+                        ]
+                    }
+                else:
+                    print(f"Error from Ollama API: {response.status_code}")
+                    print(response.text)
+                    return {"choices": [{"text": f"Error: {response.status_code}", "finish_reason": "error"}]}
+            except Exception as e:
+                print(f"Exception during Ollama API call: {str(e)}")
+                return {"choices": [{"text": f"Exception: {str(e)}", "finish_reason": "error"}]}
+    
+    def check_model_availability(self):
+        """Check if the model is available on the Ollama server"""
+        try:
+            response = requests.get(f"{self.ollama_api_base}/api/tags")
+            if response.status_code == 200:
+                models = response.json().get("models", [])
+                model_names = [model.get("name") for model in models]
+                
+                if self.model_name in model_names:
+                    print(f"✅ Model {self.model_name} is available on Ollama server")
+                else:
+                    print(f"⚠️ Warning: Model {self.model_name} not found on Ollama server")
+                    print(f"Available models: {', '.join(model_names)}")
+            else:
+                print(f"⚠️ Warning: Failed to check model availability. Status code: {response.status_code}")
+        except Exception as e:
+            print(f"⚠️ Warning: Error checking model availability: {str(e)}")
 
     def one_shot_mode(self, user_input: str) -> str:
         chat_history = [{"role": "system", "content": self.system_prompt}]
         chat_history.append({"role": "user", "content": user_input})
         full_prompt = self.format_chat(chat_history)
+        
         with AgentPhi4Mini.suppress_native_stderr():
             output_raw = self.llm(prompt=full_prompt, max_tokens=100, temperature=0.2, stream=False)
         
-        # unfortuntely llama_cpp has a union type for the output
-        output = cast(CreateCompletionResponse, output_raw)
+        # Format matches the original code's structure for compatibility
+        output = cast(Dict[str, Any], output_raw)
         
-        assistant_reply : str = output["choices"][0]["text"].strip() 
-        return assistant_reply 
-        
-    
+        assistant_reply: str = output["choices"][0]["text"].strip() 
+        return assistant_reply
+
     def format_chat(self, messages: List[dict[str, str]]) -> str:
         chat_prompt = ""
         for msg in messages:
@@ -78,14 +131,9 @@ class AgentPhi4Mini(LLMAgent):
     @staticmethod
     def suppress_native_stderr():
         """
-        Redirect C‐level stderr (fd 2) into /dev/null, so llama.cpp logs vanish.
+        Kept for compatibility, but does nothing since we're not using llama.cpp.
         """
-        devnull_fd = os.open(os.devnull, os.O_WRONLY)
-        saved_stderr_fd = os.dup(2)
         try:
-            os.dup2(devnull_fd, 2)
             yield
         finally:
-            os.dup2(saved_stderr_fd, 2)
-            os.close(devnull_fd)
-            os.close(saved_stderr_fd)
+            pass
